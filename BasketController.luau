@@ -50,7 +50,7 @@ for _, part in ipairs(workspace:GetDescendants()) do
 	end
 end
 
--- Welder.Value stores the owner name empty string means nobody has it
+-- welder.Value stores the owner name empty string means nobody has it
 local function registerBallTouched(ball)
 	ball.Touched:Connect(function(hit)
 		local char = hit.Parent
@@ -173,7 +173,7 @@ Remotes.Shoot.OnServerEvent:Connect(function(plr, _bool, num)
 			if track.Name == "Right-Dribble" then track:Stop() end
 		end
 
-		-- BodyGyro smoothly locks rotation toward the goal without teleporting
+		-- bodyGyro smoothly locks rotation toward the goal without teleporting
 		local bodyGyro     = Instance.new("BodyGyro", root)
 		bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
 		bodyGyro.D         = 275
