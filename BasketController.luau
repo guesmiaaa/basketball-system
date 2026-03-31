@@ -1,238 +1,320 @@
 -- Basketball shooting system
--- Handles ball possession, shot meter, physics and goal detection
+-- Handles possession, shot meter, physics and goal detection
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService      = game:GetService("TweenService")
 local ServerStorage     = game:GetService("ServerStorage")
 local PhysicsService    = game:GetService("PhysicsService")
 local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
 
 local GameSettings = ReplicatedStorage:FindFirstChild("GameSettings")
 local Remotes      = GameSettings:FindFirstChild("Remotes")
 
--- GoalFinder class
-local GoalFinder  = {}
-GoalFinder.__index = GoalFinder
+local Config = {
+	GoalName         = "Goal",
+	CollisionBall    = "Ball",
+	CollisionPlayer  = "Player",
 
-function GoalFinder.new(goalName)
-	local self = setmetatable({}, GoalFinder)
-	self.goalName = goalName
-	return self
+	FlightBase       = 1.1,
+	FlightDist       = 110,
+	GravityDiv       = math.pi,
+	VelocityDiv      = 1.035,
+	MaxOffset        = 0,
+	MinOffset        = 1.25,
+	WaitAfterShot    = 1.25,
+
+	GyroDamping      = 275,
+	GyroPower        = 5000,
+
+	DefaultWalkSpeed = 16,
+	ShotWalkSpeed    = 0,
+
+	CooldownTime     = 1.5,
+	AccuracyBonus    = 5,
+}
+
+-- cooldown manager to stop shot spamming
+local CooldownManager = {}
+CooldownManager.__index = CooldownManager
+
+function CooldownManager.new()
+	local Self = setmetatable({}, CooldownManager)
+	Self.Cooldowns = {}
+	return Self
 end
 
-function GoalFinder:findNearest(root)
-	local closestDist = math.huge
-	local closestGoal = nil
+function CooldownManager:Check(Player)
+	local Last = self.Cooldowns[Player.UserId]
+	if not Last then return true end
+	return (os.clock() - Last) >= Config.CooldownTime
+end
 
-	for _, part in ipairs(workspace:GetDescendants()) do
-		if part.Name == self.goalName and part:IsA("BasePart") then
-			local dist = (part.Position - root.Position).Magnitude
-			if dist < closestDist then
-				closestDist = dist
-				closestGoal = part
+function CooldownManager:Set(Player)
+	self.Cooldowns[Player.UserId] = os.clock()
+end
+
+function CooldownManager:Remove(Player)
+	self.Cooldowns[Player.UserId] = nil
+end
+
+local Cooldowns = CooldownManager.new()
+
+-- finds the nearest goal part to a root
+local GoalFinder = {}
+GoalFinder.__index = GoalFinder
+
+function GoalFinder.new(GoalName)
+	local Self = setmetatable({}, GoalFinder)
+	Self.GoalName = GoalName
+	return Self
+end
+
+function GoalFinder:FindNearest(Root)
+	local ClosestDist = math.huge
+	local ClosestGoal = nil
+
+	for _, Part in ipairs(workspace:GetDescendants()) do
+		if Part.Name == self.GoalName and Part:IsA("BasePart") then
+			local Dist = (Part.Position - Root.Position).Magnitude
+			if Dist < ClosestDist then
+				ClosestDist = Dist
+				ClosestGoal = Part
 			end
 		end
 	end
 
-	return closestGoal
+	return ClosestGoal
 end
 
-local goalFinder = GoalFinder.new("Goal")
+local Finder = GoalFinder.new(Config.GoalName)
 
--- ball doesnt physically collide with players but touched still fires
-PhysicsService:CreateCollisionGroup("Ball")
-PhysicsService:CreateCollisionGroup("Player")
-PhysicsService:CollisionGroupsAreCollidable("Ball", "Player", false)
+-- setup collision groups so ball doesnt physically block players
+PhysicsService:RegisterCollisionGroup(Config.CollisionBall)
+PhysicsService:RegisterCollisionGroup(Config.CollisionPlayer)
+PhysicsService:CollisionGroupSetCollidable(Config.CollisionBall, Config.CollisionPlayer, false)
 
-for _, part in ipairs(workspace:GetDescendants()) do
-	if part:IsA("BasePart") and part.Name == "Ball" then
-		PhysicsService:SetPartCollisionGroup(part, "Ball")
+local function SetBallCollision(Part)
+	Part.CollisionGroup = Config.CollisionBall
+end
+
+local function SetPlayerCollision(Part)
+	Part.CollisionGroup = Config.CollisionPlayer
+end
+
+for _, Part in ipairs(workspace:GetDescendants()) do
+	if Part:IsA("BasePart") and Part.Name == "Ball" then
+		SetBallCollision(Part)
 	end
 end
 
--- welder.Value stores the owner name empty string means nobody has it
-local function registerBallTouched(ball)
-	ball.Touched:Connect(function(hit)
-		local char = hit.Parent
-		if not char or not char:FindFirstChild("Humanoid") then return end
-		if char:FindFirstChild("Ball") then return end
+-- accuracy from 0-100 based on bar fill, reduced by contest
+local function CalculatePercent(BarSize, ContestValue)
+	if BarSize > 0.5 then
+		BarSize = 0.5 - (0.5 - BarSize) * -1
+	end
 
-		local settings = ball:FindFirstChild("Settings")
-		if not settings then return end
+	local BasePercent = (BarSize / 0.5) * 100
+	local Percent     = math.clamp(BasePercent + Config.AccuracyBonus - ContestValue, 0, 100)
 
-		local welder = settings:FindFirstChild("Welder")
-		if not welder or welder.Value ~= "" then return end
+	if RunService:IsStudio() then
+		warn(string.format("[Shot] Accuracy: %d%% Contest: %d", math.floor(Percent), ContestValue))
+	end
 
-		local root         = char:FindFirstChild("HumanoidRootPart")
-		local scriptFolder = char:FindFirstChild("Scripts")
-		if not root or not scriptFolder then return end
+	return math.floor(Percent)
+end
 
-		local animations = scriptFolder.Animations.Get:Invoke()
+-- offset curves the shot left or right based on timing
+local function CalculateOffset(BarSize, Percent)
+	if BarSize > 0.5 then
+		return (Percent * (Config.MaxOffset - Config.MinOffset) / 100) + Config.MinOffset
+	else
+		return (Percent * (Config.MaxOffset - (-Config.MinOffset)) / 100) + (-Config.MinOffset)
+	end
+end
 
-		ball.Parent        = char
-		ball.Connect.Part0 = root
-		welder.Value       = char.Name
+-- solves launch velocity using kinematics to reach the goal
+local function SolveLaunchVelocity(Origin, Target, FlightTime)
+	local GravityVec = Vector3.new(0, -workspace.Gravity / Config.GravityDiv, 0)
+	return (Target - Origin - 0.5 * GravityVec * FlightTime ^ 2) / FlightTime / Config.VelocityDiv
+end
 
-		if animations["Right-Dribble"] then
-			animations["Right-Dribble"]:Play()
+-- detaches ball from character and launches it
+local function OnRelease(Ball, Goal, BarSize, Percent)
+	local Dist       = (Ball.Position - Goal.Position).Magnitude
+	local FlightTime = Config.FlightBase + (Dist / Config.FlightDist)
+	local Offset     = CalculateOffset(BarSize, Percent)
+	local V0         = SolveLaunchVelocity(Ball.Position, Goal.Position, FlightTime)
+
+	local Connect = Ball:FindFirstChild("Connect")
+	if Connect then
+		Connect.Part0 = nil
+	end
+
+	Ball.Parent                = workspace
+	Ball.AssemblyLinearVelocity  = V0 + Vector3.new(Offset, Offset, Offset)
+	Ball.AssemblyAngularVelocity = Vector3.new(0, 0, 15)
+	Ball:SetNetworkOwner(nil)
+
+	task.wait(Config.WaitAfterShot)
+
+	local Settings = Ball:FindFirstChild("Settings")
+	if Settings and Settings:FindFirstChild("Welder") then
+		Settings.Welder.Value = ""
+	end
+end
+
+-- gives ball possession to whoever touches it
+local function RegisterBallTouched(Ball)
+	Ball.Touched:Connect(function(Hit)
+		local Char = Hit.Parent
+		if not Char or not Char:FindFirstChildOfClass("Humanoid") then return end
+		if Char:FindFirstChild("Ball") then return end
+
+		local Settings = Ball:FindFirstChild("Settings")
+		if not Settings then return end
+
+		local Welder = Settings:FindFirstChild("Welder")
+		if not Welder or Welder.Value ~= "" then return end
+
+		local Root         = Char:FindFirstChild("HumanoidRootPart")
+		local ScriptFolder = Char:FindFirstChild("Scripts")
+		if not Root or not ScriptFolder then return end
+
+		local Animations = ScriptFolder.Animations.Get:Invoke()
+
+		local Connect = Ball:FindFirstChild("Connect")
+		if Connect then
+			Connect.Part0 = Root
+		end
+
+		Ball.Parent  = Char
+		Welder.Value = Char.Name
+
+		if Animations["Right-Dribble"] then
+			Animations["Right-Dribble"]:Play()
 		end
 	end)
 end
 
-for _, obj in ipairs(workspace:GetDescendants()) do
-	if obj:IsA("BasePart") and obj.Name == "Ball" then
-		registerBallTouched(obj)
+for _, Obj in ipairs(workspace:GetDescendants()) do
+	if Obj:IsA("BasePart") and Obj.Name == "Ball" then
+		RegisterBallTouched(Obj)
 	end
 end
 
--- maps bar fill to accuracy % contest value lowers it if defender is close
-local function calculatePercent(barSize, contestValue)
-	if barSize > 0.5 then
-		barSize = 0.5 - (0.5 - barSize) * -1
-	end
+-- num 1 = shot press, num 2 = early release
+Remotes.Shoot.OnServerEvent:Connect(function(Plr, _Bool, Num)
+	if not Cooldowns:Check(Plr) then return end
 
-	local basePercent = (barSize / 0.5) * 100
-	local percent     = math.clamp(basePercent + 5 - contestValue, 0, 100)
+	local Char = Plr.Character
+	if not Char then return end
 
-	warn(string.format("[ShotSystem] Accuracy: %d%%", math.floor(percent)))
-	return math.floor(percent)
-end
+	local Humanoid     = Char:FindFirstChildOfClass("Humanoid")
+	local Root         = Char:FindFirstChild("HumanoidRootPart")
+	local Ball         = Char:FindFirstChild("Ball")
+	local Values       = Char:FindFirstChild("Values")
+	local ScriptFolder = Char:FindFirstChild("Scripts")
+	if not Humanoid or not Root or not Ball or not Values or not ScriptFolder then return end
 
--- early release curves positive late release curves negative
-local function calculateOffset(barSize, percent)
-	local maxOffset = 0
-	local minOffset = 1.25
+	local Shooting = Values:FindFirstChild("Shooting")
+	local Contest  = Values:FindFirstChild("Contest")
+	if not Shooting or not Contest then return end
 
-	if barSize > 0.5 then
-		return (percent * (maxOffset - minOffset) / 100) + minOffset
-	else
-		return (percent * (maxOffset - -minOffset) / 100) + -minOffset
-	end
-end
+	local Animations = ScriptFolder.Animations.Get:Invoke()
+	local Goal       = Finder:FindNearest(Root)
+	if not Goal then return end
 
--- kinematic solve for launch velocity: v0 = (target - x0 - 0.5*g*t^2) / t
--- gravity divided by pi gives a natural looking arc
-local function onRelease(ball, goal, barSize, percent)
-	local dist       = (ball.Position - goal.Position).Magnitude
-	local flightTime = 1.1 + (dist / 110)
-	local gravityVec = Vector3.new(0, -workspace.Gravity / math.pi, 0)
+	local ShotmeterUI = Root:FindFirstChild("ShotmeterUI")
+	local Bar         = ShotmeterUI and ShotmeterUI:FindFirstChild("Meter") and ShotmeterUI.Meter:FindFirstChild("Bar")
+	if not Bar then return end
 
-	local x0 = ball.Position
-	local v0 = (goal.Position - x0 - 0.5 * gravityVec * flightTime ^ 2) / flightTime / 1.035
+	local AnimLength    = (Animations["Jumpshot-1"] and Animations["Jumpshot-1"].Length) or 1
+	local BarTweenInfo  = TweenInfo.new(AnimLength / 2, Enum.EasingStyle.Linear, Enum.EasingDirection.In)
+	local StopTweenInfo = TweenInfo.new(0, Enum.EasingStyle.Linear, Enum.EasingDirection.In)
+	local BarTween      = TweenService:Create(Bar, BarTweenInfo,  { Size = UDim2.new(1, 0, -1, 0) })
+	local StopTween     = TweenService:Create(Bar, StopTweenInfo, { Size = UDim2.new(1, 0, Bar.Size.Y.Scale, 0) })
 
-	local offset = calculateOffset(barSize, percent)
+	if Num == 1 then
+		Cooldowns:Set(Plr)
+		Shooting.Value = true
 
-	ball.Connect.Part0 = nil
-	ball.Parent        = workspace
-	ball.Velocity      = v0 + Vector3.new(offset, offset, offset)
-	ball.RotVelocity   = Vector3.new(0, 0, 15)
-	ball:SetNetworkOwner(nil)
-
-	task.wait(1.25)
-
-	local s = ball:FindFirstChild("Settings")
-	if s and s:FindFirstChild("Welder") then
-		s.Welder.Value = ""
-	end
-end
-
--- num 1 = shot press num 2 = early release
-Remotes.Shoot.OnServerEvent:Connect(function(plr, _bool, num)
-	local char = plr.Character
-	if not char then return end
-
-	local humanoid     = char:FindFirstChildOfClass("Humanoid")
-	local root         = char:FindFirstChild("HumanoidRootPart")
-	local ball         = char:FindFirstChild("Ball")
-	local values       = char:FindFirstChild("Values")
-	local scriptFolder = char:FindFirstChild("Scripts")
-	if not humanoid or not root or not ball or not values or not scriptFolder then return end
-
-	local shooting = values:FindFirstChild("Shooting")
-	local contest  = values:FindFirstChild("Contest")
-	if not shooting or not contest then return end
-
-	local animations = scriptFolder.Animations.Get:Invoke()
-	local goal       = goalFinder:findNearest(root)
-	if not goal then return end
-
-	local shotmeterUI = root:FindFirstChild("ShotmeterUI")
-	local bar         = shotmeterUI and shotmeterUI:FindFirstChild("Meter") and shotmeterUI.Meter:FindFirstChild("Bar")
-	if not bar then return end
-
-	local animLength    = animations["Jumpshot-1"] and animations["Jumpshot-1"].Length or 1
-	local barTweenInfo  = TweenInfo.new(animLength / 2, Enum.EasingStyle.Linear, Enum.EasingDirection.In)
-	local stopTweenInfo = TweenInfo.new(0, Enum.EasingStyle.Linear, Enum.EasingDirection.In)
-	local barTween      = TweenService:Create(bar, barTweenInfo,  { Size = UDim2.new(1, 0, -1, 0) })
-	local stopTween     = TweenService:Create(bar, stopTweenInfo, { Size = UDim2.new(1, 0, bar.Size.Y.Scale, 0) })
-
-	if num == 1 then
-		shooting.Value = true
-
-		for _, track in pairs(animations) do
-			if track.Name == "Right-Dribble" then track:Stop() end
+		for _, Track in pairs(Animations) do
+			if Track.Name == "Right-Dribble" then
+				Track:Stop()
+			end
 		end
 
-		-- bodyGyro smoothly locks rotation toward the goal without teleporting
-		local bodyGyro     = Instance.new("BodyGyro", root)
-		bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-		bodyGyro.D         = 275
-		bodyGyro.P         = 5000
-		bodyGyro.CFrame    = CFrame.lookAt(
-			root.Position,
-			Vector3.new(goal.Position.X, root.Position.Y, goal.Position.Z)
+		local BodyGyro        = Instance.new("BodyGyro", Root)
+		BodyGyro.MaxTorque    = Vector3.new(math.huge, math.huge, math.huge)
+		BodyGyro.D            = Config.GyroDamping
+		BodyGyro.P            = Config.GyroPower
+		BodyGyro.CFrame       = CFrame.lookAt(
+			Root.Position,
+			Vector3.new(Goal.Position.X, Root.Position.Y, Goal.Position.Z)
 		)
-		humanoid.WalkSpeed = 0
 
+		Humanoid.WalkSpeed = Config.ShotWalkSpeed
 		task.wait()
-		animations["Jumpshot-1"]:Play(0.5)
 
-		animations["Jumpshot-1"].KeyframeReached:Connect(function(frame)
-			if frame == "Release" then
-				local barSize = -bar.Size.Y.Scale
-				local percent = calculatePercent(barSize, contest.Value)
-				onRelease(ball, goal, barSize, percent)
-				shooting.Value = false
-				contest.Value  = 0
+		Animations["Jumpshot-1"]:Play(0.5)
+
+		Animations["Jumpshot-1"].KeyframeReached:Connect(function(Frame)
+			if Frame == "Release" then
+				local BarSize = -Bar.Size.Y.Scale
+				local Percent = CalculatePercent(BarSize, Contest.Value)
+				OnRelease(Ball, Goal, BarSize, Percent)
+				Shooting.Value = false
+				Contest.Value  = 0
 			end
 		end)
 
-		barTween:Play()
+		BarTween:Play()
 
-		task.wait(animLength + 0.25)
-		bodyGyro:Destroy()
-		humanoid.WalkSpeed = 16
-		bar.Size = UDim2.new(1, 0, 0, 0)
+		task.wait(AnimLength + 0.25)
+		BodyGyro:Destroy()
+		Humanoid.WalkSpeed = Config.DefaultWalkSpeed
+		Bar.Size = UDim2.new(1, 0, 0, 0)
 
-	elseif num == 2 then
-		stopTween:Play()
+	elseif Num == 2 then
+		StopTween:Play()
 	end
 end)
 
-Players.PlayerAdded:Connect(function(plr)
-	plr.CharacterAdded:Connect(function(char)
-		local root       = char:WaitForChild("HumanoidRootPart")
-		local meterClone = ServerStorage:FindFirstChild("ShotmeterUI"):Clone()
-		meterClone.Parent = root
+Players.PlayerAdded:Connect(function(Plr)
+	Plr.CharacterAdded:Connect(function(Char)
+		local Root          = Char:WaitForChild("HumanoidRootPart")
+		local MeterTemplate = ServerStorage:FindFirstChild("ShotmeterUI")
 
-		for _, part in ipairs(char:GetChildren()) do
-			if part:IsA("BasePart") then
-				PhysicsService:SetPartCollisionGroup(part, "Player")
+		if MeterTemplate then
+			MeterTemplate:Clone().Parent = Root
+		end
+
+		for _, Part in ipairs(Char:GetChildren()) do
+			if Part:IsA("BasePart") then
+				SetPlayerCollision(Part)
 			end
 		end
 	end)
 
-	plr.Chatted:Connect(function(msg)
-		if msg == ":ball" then
-			local char = plr.Character
-			if not char or char:FindFirstChild("Ball") then return end
+	Plr.Chatted:Connect(function(Msg)
+		if Msg:lower() == ":ball" then
+			local Char = Plr.Character
+			if not Char or Char:FindFirstChild("Ball") then return end
 
-			local newBall    = ServerStorage:FindFirstChild("Ball"):Clone()
-			newBall.Parent   = workspace
-			newBall.Position = char.HumanoidRootPart.Position
+			local BallTemplate = ServerStorage:FindFirstChild("Ball")
+			if not BallTemplate then return end
 
-			PhysicsService:SetPartCollisionGroup(newBall, "Ball")
-			registerBallTouched(newBall)
+			local NewBall    = BallTemplate:Clone()
+			NewBall.Parent   = workspace
+			NewBall.Position = Char.HumanoidRootPart.Position
+
+			SetBallCollision(NewBall)
+			RegisterBallTouched(NewBall)
 		end
 	end)
+end)
+
+Players.PlayerRemoving:Connect(function(Plr)
+	Cooldowns:Remove(Plr)
 end)
