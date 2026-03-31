@@ -16,25 +16,25 @@ local Config = {
 	CollisionBall    = "Ball",
 	CollisionPlayer  = "Player",
 
-	FlightBase       = 1.1,
-	FlightDist       = 110,
-	GravityDiv       = math.pi,
-	VelocityDiv      = 1.035,
+	FlightBase       = 1.1,    -- base flight time in seconds
+	FlightDist       = 110,    -- divisor for distance-based flight time
+	GravityDiv       = math.pi, -- dividing gravity by pi gives a natural arc
+	VelocityDiv      = 1.035,  -- slight velocity reduction for realistic feel
 	MaxOffset        = 0,
-	MinOffset        = 1.25,
-	WaitAfterShot    = 1.25,
+	MinOffset        = 1.25,   -- max curve on a bad release
+	WaitAfterShot    = 1.25,   -- seconds before resetting ball ownership
 
 	GyroDamping      = 275,
 	GyroPower        = 5000,
 
 	DefaultWalkSpeed = 16,
-	ShotWalkSpeed    = 0,
+	ShotWalkSpeed    = 0,      -- freeze player during shot animation
 
-	CooldownTime     = 1.5,
-	AccuracyBonus    = 5,
+	CooldownTime     = 1.5,    -- seconds between allowed shots
+	AccuracyBonus    = 5,      -- flat accuracy boost added to every shot
 }
 
--- cooldown manager to stop shot spamming
+-- tracks last shot time per player to prevent spamming
 local CooldownManager = {}
 CooldownManager.__index = CooldownManager
 
@@ -60,7 +60,7 @@ end
 
 local Cooldowns = CooldownManager.new()
 
--- finds the nearest goal part to a root
+-- scans workspace to find the closest goal part to a given root
 local GoalFinder = {}
 GoalFinder.__index = GoalFinder
 
@@ -89,7 +89,8 @@ end
 
 local Finder = GoalFinder.new(Config.GoalName)
 
--- setup collision groups so ball doesnt physically block players
+-- ball and player are in separate collision groups so they dont block each other
+-- but Touched events still fire normally
 PhysicsService:RegisterCollisionGroup(Config.CollisionBall)
 PhysicsService:RegisterCollisionGroup(Config.CollisionPlayer)
 PhysicsService:CollisionGroupSetCollidable(Config.CollisionBall, Config.CollisionPlayer, false)
@@ -102,14 +103,16 @@ local function SetPlayerCollision(Part)
 	Part.CollisionGroup = Config.CollisionPlayer
 end
 
+-- assign collision group to any balls already in workspace on startup
 for _, Part in ipairs(workspace:GetDescendants()) do
 	if Part:IsA("BasePart") and Part.Name == "Ball" then
 		SetBallCollision(Part)
 	end
 end
 
--- accuracy from 0-100 based on bar fill, reduced by contest
+-- converts bar fill into a 0-100 accuracy score, reduced by how close a defender is
 local function CalculatePercent(BarSize, ContestValue)
+	-- mirror the value if player released late so both sides score the same
 	if BarSize > 0.5 then
 		BarSize = 0.5 - (0.5 - BarSize) * -1
 	end
@@ -118,13 +121,13 @@ local function CalculatePercent(BarSize, ContestValue)
 	local Percent     = math.clamp(BasePercent + Config.AccuracyBonus - ContestValue, 0, 100)
 
 	if RunService:IsStudio() then
-		warn(string.format("[Shot] Accuracy: %d%% Contest: %d", math.floor(Percent), ContestValue))
+		warn(string.format("[Shot] Accuracy: %d%% | Contest: %d", math.floor(Percent), ContestValue))
 	end
 
 	return math.floor(Percent)
 end
 
--- offset curves the shot left or right based on timing
+-- early release curves shot one way, late release curves it the other
 local function CalculateOffset(BarSize, Percent)
 	if BarSize > 0.5 then
 		return (Percent * (Config.MaxOffset - Config.MinOffset) / 100) + Config.MinOffset
@@ -133,13 +136,13 @@ local function CalculateOffset(BarSize, Percent)
 	end
 end
 
--- solves launch velocity using kinematics to reach the goal
+-- kinematic formula: v0 = (target - x0 - 0.5*g*t^2) / t
 local function SolveLaunchVelocity(Origin, Target, FlightTime)
 	local GravityVec = Vector3.new(0, -workspace.Gravity / Config.GravityDiv, 0)
 	return (Target - Origin - 0.5 * GravityVec * FlightTime ^ 2) / FlightTime / Config.VelocityDiv
 end
 
--- detaches ball from character and launches it
+-- unwelds ball from character and launches it toward the goal
 local function OnRelease(Ball, Goal, BarSize, Percent)
 	local Dist       = (Ball.Position - Goal.Position).Magnitude
 	local FlightTime = Config.FlightBase + (Dist / Config.FlightDist)
@@ -151,11 +154,12 @@ local function OnRelease(Ball, Goal, BarSize, Percent)
 		Connect.Part0 = nil
 	end
 
-	Ball.Parent                = workspace
+	Ball.Parent                  = workspace
 	Ball.AssemblyLinearVelocity  = V0 + Vector3.new(Offset, Offset, Offset)
 	Ball.AssemblyAngularVelocity = Vector3.new(0, 0, 15)
 	Ball:SetNetworkOwner(nil)
 
+	-- wait for ball to finish traveling then clear ownership so someone else can grab it
 	task.wait(Config.WaitAfterShot)
 
 	local Settings = Ball:FindFirstChild("Settings")
@@ -164,7 +168,7 @@ local function OnRelease(Ball, Goal, BarSize, Percent)
 	end
 end
 
--- gives ball possession to whoever touches it
+-- when a ball is touched by a player who doesnt already have one, give them possession
 local function RegisterBallTouched(Ball)
 	Ball.Touched:Connect(function(Hit)
 		local Char = Hit.Parent
@@ -183,6 +187,7 @@ local function RegisterBallTouched(Ball)
 
 		local Animations = ScriptFolder.Animations.Get:Invoke()
 
+		-- weld ball to the character root part
 		local Connect = Ball:FindFirstChild("Connect")
 		if Connect then
 			Connect.Part0 = Root
@@ -239,17 +244,19 @@ Remotes.Shoot.OnServerEvent:Connect(function(Plr, _Bool, Num)
 		Cooldowns:Set(Plr)
 		Shooting.Value = true
 
+		-- stop dribble before playing jump shot animation
 		for _, Track in pairs(Animations) do
 			if Track.Name == "Right-Dribble" then
 				Track:Stop()
 			end
 		end
 
-		local BodyGyro        = Instance.new("BodyGyro", Root)
-		BodyGyro.MaxTorque    = Vector3.new(math.huge, math.huge, math.huge)
-		BodyGyro.D            = Config.GyroDamping
-		BodyGyro.P            = Config.GyroPower
-		BodyGyro.CFrame       = CFrame.lookAt(
+		-- rotate character to face the goal smoothly without teleporting
+		local BodyGyro     = Instance.new("BodyGyro", Root)
+		BodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+		BodyGyro.D         = Config.GyroDamping
+		BodyGyro.P         = Config.GyroPower
+		BodyGyro.CFrame    = CFrame.lookAt(
 			Root.Position,
 			Vector3.new(Goal.Position.X, Root.Position.Y, Goal.Position.Z)
 		)
@@ -259,6 +266,7 @@ Remotes.Shoot.OnServerEvent:Connect(function(Plr, _Bool, Num)
 
 		Animations["Jumpshot-1"]:Play(0.5)
 
+		-- release the ball when the animation hits the Release keyframe
 		Animations["Jumpshot-1"].KeyframeReached:Connect(function(Frame)
 			if Frame == "Release" then
 				local BarSize = -Bar.Size.Y.Scale
@@ -277,6 +285,7 @@ Remotes.Shoot.OnServerEvent:Connect(function(Plr, _Bool, Num)
 		Bar.Size = UDim2.new(1, 0, 0, 0)
 
 	elseif Num == 2 then
+		-- freeze bar at current position for early release
 		StopTween:Play()
 	end
 end)
@@ -286,6 +295,7 @@ Players.PlayerAdded:Connect(function(Plr)
 		local Root          = Char:WaitForChild("HumanoidRootPart")
 		local MeterTemplate = ServerStorage:FindFirstChild("ShotmeterUI")
 
+		-- attach shot meter UI to root so it follows the player
 		if MeterTemplate then
 			MeterTemplate:Clone().Parent = Root
 		end
@@ -315,6 +325,7 @@ Players.PlayerAdded:Connect(function(Plr)
 	end)
 end)
 
+-- clean up cooldown data when player leaves to avoid memory leaks
 Players.PlayerRemoving:Connect(function(Plr)
 	Cooldowns:Remove(Plr)
 end)
